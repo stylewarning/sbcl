@@ -19,6 +19,9 @@
 #include <sys/file.h>
 
 #include "genesis/sbcl.h"
+#ifdef LISP_FEATURE_DARWIN
+#include <mach-o/loader.h>
+#endif
 #ifdef LISP_FEATURE_WIN32
 #include "pthreads_win32.h"
 #else
@@ -46,6 +49,206 @@
 #define COMPRESSION_LEVEL_NONE INT_MIN
 
 #define GENERAL_WRITE_FAILURE_MSG "error writing to core file"
+
+/* Embedded-core executables are only rewritten here in the narrow tail-section/
+ * tail-segment cases that our helper currently emits. Anything more general
+ * would require a real PE/Mach-O rewriter that can safely repack later file
+ * data and adjust all affected metadata. Be conservative: if we recognize an
+ * embedded-core layout but can't prove that truncating away the embedded core
+ * is safe, fail the save instead of producing a broken executable or silently
+ * retaining the parent core. */
+#if defined(LISP_FEATURE_DARWIN) && defined(LISP_FEATURE_64_BIT)
+static int remove_embedded_macho_core_section(void *runtime, size_t *runtime_size_io,
+                                              os_vm_offset_t core_offset)
+{
+    struct mach_header_64 *header;
+    os_vm_offset_t load_commands_end, command_offset;
+    size_t runtime_size = *runtime_size_io;
+    struct segment_command_64 *target_segment = 0;
+    struct section_64 *target_section = 0;
+    struct linkedit_data_command *code_signature = 0;
+    os_vm_offset_t new_runtime_size = -1;
+    int found = 0;
+    uint32_t i;
+
+    if (runtime_size < sizeof(*header))
+        return 0;
+
+    header = (struct mach_header_64*)runtime;
+    if (header->magic != MH_MAGIC_64)
+        return 0;
+
+    load_commands_end = sizeof(*header) + header->sizeofcmds;
+    if (load_commands_end > (os_vm_offset_t)runtime_size)
+        return 0;
+
+    command_offset = sizeof(*header);
+    for (i = 0; i < header->ncmds; ++i) {
+        struct load_command *command = (struct load_command*)((char*)runtime + command_offset);
+        if (command_offset > (os_vm_offset_t)(runtime_size - sizeof(*command)) ||
+            command->cmdsize < sizeof(*command) ||
+            command_offset + command->cmdsize > load_commands_end)
+            return 0;
+
+        if (command->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *segment = (struct segment_command_64*)command;
+            os_vm_offset_t section_offset, command_end;
+            uint32_t j;
+
+            if (command->cmdsize < sizeof(*segment))
+                return 0;
+            if (segment->filesize &&
+                (segment->fileoff > runtime_size ||
+                 segment->filesize > runtime_size - segment->fileoff))
+                return -1;
+            section_offset = command_offset + sizeof(*segment);
+            command_end = command_offset + command->cmdsize;
+            for (j = 0; j < segment->nsects;
+                 ++j, section_offset += sizeof(struct section_64)) {
+                struct section_64 *section = (struct section_64*)((char*)runtime + section_offset);
+                if (section_offset > command_end - (os_vm_offset_t)sizeof(*section))
+                    return 0;
+                if (!strncmp(section->segname, "__SBCL", sizeof(section->segname)) &&
+                    !strncmp(section->sectname, "__core", sizeof(section->sectname)) &&
+                    section->size &&
+                    section->offset == (uint32_t)core_offset) {
+                    if (found)
+                        return -1;
+                    if (segment->nsects != 1 ||
+                        segment->fileoff != section->offset ||
+                        segment->filesize != section->size)
+                        return -1;
+                    target_segment = segment;
+                    target_section = section;
+                    new_runtime_size = segment->fileoff;
+                    found = 1;
+                }
+            }
+            if (found && segment != target_segment && segment->filesize &&
+                (os_vm_offset_t)(segment->fileoff + segment->filesize) > new_runtime_size)
+                return -1;
+        } else if (command->cmd == LC_CODE_SIGNATURE) {
+            code_signature = (struct linkedit_data_command*)command;
+        }
+        command_offset += command->cmdsize;
+    }
+    if (!found)
+        return 0;
+    if (code_signature && code_signature->datasize) {
+        if (code_signature->dataoff < (uint32_t)new_runtime_size)
+            return -1;
+        code_signature->dataoff = 0;
+        code_signature->datasize = 0;
+    }
+
+    target_segment->filesize = 0;
+    target_segment->vmsize = 0;
+    target_segment->fileoff = new_runtime_size;
+    target_segment->nsects = 0;
+    memset(target_section, 0, sizeof(*target_section));
+    *runtime_size_io = new_runtime_size;
+    return 1;
+}
+#endif
+
+#ifdef LISP_FEATURE_WIN32
+static int remove_embedded_pe_core_section(void *runtime, size_t *runtime_size_io,
+                                           os_vm_offset_t core_offset)
+{
+    IMAGE_DOS_HEADER *dos_header;
+    PIMAGE_NT_HEADERS nt_header;
+    PIMAGE_SECTION_HEADER section, target = 0;
+    size_t runtime_size = *runtime_size_io;
+    char *runtime_end = (char*)runtime + runtime_size;
+    WORD target_index = 0;
+    int i;
+    DWORD max_raw_end = 0;
+    DWORD max_virtual_end = 0;
+    DWORD new_runtime_size = 0;
+
+    if (runtime_size < sizeof(*dos_header))
+        return 0;
+
+    dos_header = (IMAGE_DOS_HEADER*)runtime;
+    if (dos_header->e_magic != IMAGE_DOS_SIGNATURE || dos_header->e_lfanew < 0)
+        return 0;
+    if ((size_t)dos_header->e_lfanew > runtime_size - sizeof(*nt_header))
+        return 0;
+
+    nt_header = (PIMAGE_NT_HEADERS)((char*)runtime + dos_header->e_lfanew);
+    if (nt_header->Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+
+    section = IMAGE_FIRST_SECTION(nt_header);
+    if ((char*)section < (char*)runtime ||
+        (char*)(section + nt_header->FileHeader.NumberOfSections) > runtime_end)
+        return -1;
+
+    for (i = 0; i < nt_header->FileHeader.NumberOfSections; ++i, ++section) {
+        DWORD loaded_size;
+        DWORD virtual_end;
+        if (section->SizeOfRawData &&
+            (section->PointerToRawData > runtime_size ||
+             section->SizeOfRawData > runtime_size - section->PointerToRawData))
+            return -1;
+        if (!memcmp(section->Name, ".sbclcr", 7) &&
+            section->Name[7] == 0 &&
+            section->PointerToRawData == (DWORD)core_offset) {
+            if (target)
+                return -1;
+            target = section;
+            target_index = i;
+            new_runtime_size = section->PointerToRawData;
+            continue;
+        }
+        if (section->SizeOfRawData &&
+            section->PointerToRawData + section->SizeOfRawData > max_raw_end)
+            max_raw_end = section->PointerToRawData + section->SizeOfRawData;
+        loaded_size = section->Misc.VirtualSize > section->SizeOfRawData ?
+            section->Misc.VirtualSize : section->SizeOfRawData;
+        virtual_end = ALIGN_UP(section->VirtualAddress + loaded_size,
+                               nt_header->OptionalHeader.SectionAlignment);
+        if (virtual_end > max_virtual_end)
+            max_virtual_end = virtual_end;
+    }
+    if (!target)
+        return 0;
+    if (max_raw_end > new_runtime_size)
+        return -1;
+
+    if (target->Characteristics & IMAGE_SCN_CNT_CODE &&
+        nt_header->OptionalHeader.SizeOfCode >= target->SizeOfRawData)
+        nt_header->OptionalHeader.SizeOfCode -= target->SizeOfRawData;
+    if (target->Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA &&
+        nt_header->OptionalHeader.SizeOfInitializedData >= target->SizeOfRawData)
+        nt_header->OptionalHeader.SizeOfInitializedData -= target->SizeOfRawData;
+    if (target->Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA &&
+        nt_header->OptionalHeader.SizeOfUninitializedData >= target->Misc.VirtualSize)
+        nt_header->OptionalHeader.SizeOfUninitializedData -= target->Misc.VirtualSize;
+
+    if (target_index + 1 < nt_header->FileHeader.NumberOfSections) {
+        memmove(target, target + 1,
+                (nt_header->FileHeader.NumberOfSections - target_index - 1) *
+                sizeof(*target));
+    }
+    --nt_header->FileHeader.NumberOfSections;
+    memset(IMAGE_FIRST_SECTION(nt_header) + nt_header->FileHeader.NumberOfSections,
+           0, sizeof(*target));
+
+    nt_header->OptionalHeader.SizeOfImage =
+        max_virtual_end > nt_header->OptionalHeader.SizeOfHeaders ?
+        max_virtual_end :
+        ALIGN_UP(nt_header->OptionalHeader.SizeOfHeaders,
+                 nt_header->OptionalHeader.SectionAlignment);
+    nt_header->OptionalHeader.CheckSum = 0;
+    if (nt_header->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_SECURITY) {
+        nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress = 0;
+        nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size = 0;
+    }
+    *runtime_size_io = new_runtime_size;
+    return 1;
+}
+#endif
 
 /* write_memsize_options uses a simple serialization scheme that
  * consists of one word of magic, one word indicating the size of the
@@ -523,7 +726,7 @@ load_runtime(char *runtime_path, size_t *size_out)
 {
     void *buf = NULL;
     FILE *input = NULL;
-    size_t size, count;
+    size_t size, count, runtime_size;
     os_vm_offset_t core_offset;
 
     core_offset = search_for_embedded_core (runtime_path, 0);
@@ -536,23 +739,45 @@ load_runtime(char *runtime_path, size_t *size_out)
     size = (size_t) ftell(input);
     fseek(input, 0, SEEK_SET);
 
-    if (core_offset != -1 && size > (size_t) core_offset)
-        size = core_offset;
-
     buf = checked_malloc(size);
     if ((count = fread(buf, 1, size, input)) != size) {
         fprintf(stderr, "Premature EOF while reading runtime.\n");
         goto lose;
     }
 
-    if (!check_runtime_build_id(buf, size)) {
+    runtime_size = size;
+    if (core_offset != -1 && size > (size_t) core_offset) {
+#if defined(LISP_FEATURE_DARWIN) && defined(LISP_FEATURE_64_BIT)
+        int result = remove_embedded_macho_core_section(buf, &runtime_size, core_offset);
+        if (result < 0) {
+            fprintf(stderr, "Unable to remove embedded Mach-O core from runtime: %s\n",
+                    runtime_path);
+            goto lose;
+        }
+        if (!result)
+            runtime_size = core_offset;
+#elif defined(LISP_FEATURE_WIN32)
+        int result = remove_embedded_pe_core_section(buf, &runtime_size, core_offset);
+        if (result < 0) {
+            fprintf(stderr, "Unable to remove embedded PE core from runtime: %s\n",
+                    runtime_path);
+            goto lose;
+        }
+        if (!result)
+            runtime_size = core_offset;
+#else
+        runtime_size = core_offset;
+#endif
+    }
+
+    if (!check_runtime_build_id(buf, runtime_size)) {
         fprintf(stderr, "Failed to locate current build_id in runtime: %s\n",
             runtime_path);
         goto lose;
     }
 
     fclose(input);
-    *size_out = size;
+    *size_out = runtime_size;
     return buf;
 
 lose:
