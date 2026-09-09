@@ -113,6 +113,34 @@
   (print-mem-ref :ref value :qword stream dstate
                  :index-reg-printer #'print-xmmreg))
 
+(defun prefilter-vsib (dstate mod r/m)
+  (decode-mod-r/m dstate mod r/m 'fpr :vsib t))
+
+(defun print-half-ymmreg (value stream dstate)
+  (let* ((offset (+ (if (typep value 'reg) (reg-num value) value)
+                    (if (dstate-getprop dstate +evex-r-prime+) 16 0)))
+         (name (reg-name (get-fpr (if (dstate-getprop dstate +evex-l1+) :ymm :xmm)
+                                  offset))))
+    (if stream (write-string name stream) (operand name dstate))))
+
+(defun print-evex-vsib (value stream dstate &optional half-width)
+  (print-mem-ref
+   :ref value nil stream dstate
+   :index-reg-printer
+   (lambda (index stream dstate)
+     ;; The VSIB prefilter already applied X and V'; R' belongs to the data register.
+     (write-string
+      (reg-name (get-fpr (cond (half-width
+                               (if (dstate-getprop dstate +evex-l1+) :ymm :xmm))
+                              ((dstate-getprop dstate +evex-l1+) :zmm)
+                              ((dstate-getprop dstate +vex-l+) :ymm)
+                              (t :xmm))
+                         index))
+      stream))))
+
+(defun print-half-evex-vsib (value stream dstate)
+  (print-evex-vsib value stream dstate t))
+
 (defun print-xmmreg/mem-with-width (value width sized-p stream dstate)
   (declare (type (member :byte :word :dword :qword) width)
            (type boolean sized-p))

@@ -331,7 +331,7 @@
 ;;; MOD and R/M are the extracted bits from the instruction's ModRM byte.
 ;;; Depending on MOD and R/M, a SIB byte and/or displacement may be read.
 ;;; The REX.B and REX.X from dstate are appropriately consumed.
-(defun decode-mod-r/m (dstate mod r/m regclass &key (disp-n 1))
+(defun decode-mod-r/m (dstate mod r/m regclass &key (disp-n 1) vsib)
   (declare (type disassem-state dstate)
            (type (unsigned-byte 2) mod)
            (type (unsigned-byte 3) r/m))
@@ -373,7 +373,10 @@
                                   (extend +rex-b+ base-reg))
                                 (cond ((/= mod #b00) (displacement))
                                       ((= base-reg #b101) (read-signed-suffix 32 dstate)))
-                                (unless (= index-reg #b100) index-reg) ; index can't be RSP
+                                ;; VSIB has a vector index even when SIB.index=4.
+                                (if vsib
+                                    (+ index-reg (if (dstate-getprop dstate +evex-v-prime+) 16 0))
+                                    (unless (= index-reg #b100) index-reg))
                                 (ash 1 (ldb (byte 2 6) sib)))))
             ((/= mod #b00) (make-machine-ea full-reg (displacement)))
             ;; rex.b is not decoded in determining RIP-relative mode
