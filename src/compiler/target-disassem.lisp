@@ -454,8 +454,14 @@
       (write-char #\space stream))
     (write-char #\space stream)))
 
+;;; Bind to zero to count bytes skipped by HANDLE-BOGUS-INSTRUCTION.
+;;; Relocation scans use this to detect unreliable instruction boundaries.
+(defvar *undecoded-bytes* nil)
+
 (defun handle-bogus-instruction (stream dstate prefix-len)
   (let ((alignment (dstate-alignment dstate)))
+    (when *undecoded-bytes*
+      (incf *undecoded-bytes* alignment))
     (when stream
       (multiple-value-bind (words bytes)
           (truncate alignment sb-vm:n-word-bytes)

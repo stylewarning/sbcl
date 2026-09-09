@@ -17,7 +17,8 @@
         (relocs (make-array 100000 :element-type 'word :fill-pointer 0 :adjustable t))
         (seg (sb-disassem::%make-segment
               :sap-maker (lambda () (error "Bad sap maker")) :virtual-location 0))
-        (dstate (make-dstate nil)))
+        (dstate (make-dstate nil))
+        (unscannable nil))
     (flet ((scan-function (is-asm code sap length extra-offset predicate)
              ;; Extra offset is the amount to add to the offset supplied in the
              ;; lambda to compute the instruction offset relative to the code base.
@@ -46,14 +47,14 @@
         ;; The whole thing can be disassembled in one stroke since inter-routine
         ;; gaps are encoded as NOPs.
         (multiple-value-bind (start end) (sb-fasl::calc-asm-routine-bounds)
-          (scan-function t code
-                         (sap+ (code-instructions code) start)
-                         (- end start)
-                         ;; extra offset = header words + start
-                         (+ (ash (code-header-words code) word-shift) start)
-                         ;; calls from lisp into C code can be ignored, as
-                         ;; neither the asssembly routines nor C code will move.
-                         #'immobile-space-addr-p))
+          (when (plusp (scan-function t code
+                                     (sap+ (code-instructions code) start)
+                                     (- end start)
+                                     ;; extra offset = header words + start
+                                     (+ (ash (code-header-words code) word-shift) start)
+                                     ;; Calls into C do not need relocation.
+                                     #'immobile-space-addr-p))
+            (setf unscannable t)))
         (finish-component code relocs-index))
 
       ;; Immobile space - code components can jump to immobile space
@@ -62,19 +63,29 @@
        (lambda (code type size)
          (declare (ignore size))
          (when (and (= type code-header-widetag) (plusp (code-n-entries code)))
-           (let ((relocs-index (fill-pointer relocs)))
+           (let ((relocs-index (fill-pointer relocs))
+                 (n-bogus 0))
              (dotimes (i (code-n-entries code))
                ;; simple-funs must be individually scanned to skip over header words
                (let* ((fun (%code-entry-point code i))
                       (sap (simple-fun-entry-sap fun)))
-                 (scan-function nil code sap
-                                (%simple-fun-text-len fun i)
-                                ;; Compute the offset from the base of the code
-                                (+ (ash (code-header-words code) word-shift)
-                                   (sap- sap (code-instructions code)))
-                                #'constantly-t)))
+                 (incf n-bogus
+                       (scan-function nil code sap
+                                      (%simple-fun-text-len fun i)
+                                      ;; Compute the offset from the base of the code
+                                      (+ (ash (code-header-words code) word-shift)
+                                         (sap- sap (code-instructions code)))
+                                      #'constantly-t))))
+             (when (plusp n-bogus)
+               (setf unscannable t))
              (finish-component code relocs-index))))
        :immobile))
+
+    ;; Undecodable instructions make the relocation offsets unreliable.
+    ;; Leave text space unmoved rather than risk corrupting code. Streams
+    ;; are already closed when saving, so the runtime reports the skipped pass.
+    (setf (sb-alien:extern-alien "immobile_space_defrag_p" sb-alien:int)
+          (if unscannable 0 1))
 
     ;; Write a delimiter into the array passed to C
     (vector-push-extend 0 code-components)

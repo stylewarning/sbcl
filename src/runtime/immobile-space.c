@@ -1201,6 +1201,10 @@ int compute_codeblob_offsets_nwords(int* pcount)
     return 2 + ALIGN_UP(n_data_words, 2);
 }
 
+/* Cleared by Lisp when undecodable instructions prevent relocation.
+ * Saving without defragmenting is safe; moving code without fixups is not. */
+int immobile_space_defrag_p = 1;
+
 /* Defragment the immobile space, and then promote all objects to gen6.
  * 'coreparse' causes all pages in dynamic space to be pseudo-static, but
  * each immobile object stores its own generation, so this must be done at
@@ -1213,7 +1217,13 @@ void prepare_immobile_space_for_save(bool verbose)
     }
 
 #ifdef LISP_FEATURE_X86_64
-    defrag_immobile_space(verbose);
+    if (immobile_space_defrag_p)
+        defrag_immobile_space(verbose);
+    else {
+        if (verbose) printf("(skipped) ");
+        fprintf(stderr, "WARNING: Undecodable instructions in immobile code; "
+                        "skipping defragmentation.\n");
+    }
 #endif
 
     lispobj* obj = (lispobj*)FIXEDOBJ_SPACE_START;
