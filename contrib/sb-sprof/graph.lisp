@@ -156,6 +156,7 @@
   (unique-trace-count (sb-int:missing-arg) :type sb-int:index :read-only t)
   ;; threads that have been sampled
   (sampled-threads '()                    :type list :read-only t)
+  (diagnostics nil                      :type list :read-only t)
   ;; sample count for samples not in any function
   (elsewhere-count (sb-int:missing-arg) :type sb-int:index :read-only t))
 
@@ -390,6 +391,7 @@
                                                (samples-sample-interval samples))
                           :sampling-mode (samples-mode samples)
                           :sampled-threads (samples-sampled-threads samples)
+                          :diagnostics (samples-diagnostics samples)
                           :elsewhere-count elsewhere-count
                           :vertices sorted-nodes)))))
 
@@ -425,22 +427,23 @@
 ;;; in the FLAT-NODES slot, and a dag in VERTICES, with call cycles
 ;;; reduced to CYCLE structures.
 (defun make-call-graph (samples max-depth)
-  (stop-profiling)
-  (when (zerop (length (samples-vector samples)))
-    (show-progress "~&Aggregating raw data")
-    (setf (values (samples-vector samples)
-                  (samples-unique-trace-count samples)
-                  (samples-sampled-threads samples))
-          (convert-raw-data)))
-  (show-progress "~&Computing call graph")
-  ;; I _think_ the reason for pinning all code is that the graph logic
-  ;; compares absolute PC locations. Wonderfully commented, it is.
-  (let ((call-graph (with-code-pages-pinned (:dynamic)
-                      (make-call-graph-1 samples max-depth))))
-    (show-progress "~&Finding cycles")
-    #+nil
-    (reduce-call-graph call-graph)
-    (show-progress "~&Propagating counts")
-    #+nil
-    (compute-accrued-counts call-graph)
-    call-graph))
+  (with-profiler-lock
+    (stop-profiling)
+    (when (zerop (length (samples-vector samples)))
+      (show-progress "~&Aggregating raw data")
+      (setf (values (samples-vector samples)
+                    (samples-unique-trace-count samples)
+                    (samples-sampled-threads samples))
+            (convert-raw-data)))
+    (show-progress "~&Computing call graph")
+    ;; I _think_ the reason for pinning all code is that the graph logic
+    ;; compares absolute PC locations. Wonderfully commented, it is.
+    (let ((call-graph (with-code-pages-pinned (:dynamic)
+                        (make-call-graph-1 samples max-depth))))
+      (show-progress "~&Finding cycles")
+      #+nil
+      (reduce-call-graph call-graph)
+      (show-progress "~&Propagating counts")
+      #+nil
+      (compute-accrued-counts call-graph)
+      call-graph)))

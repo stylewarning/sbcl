@@ -1401,9 +1401,9 @@ lisp_alloc(__attribute__((unused)) int flags,
      * Code allocations are ignored, because every code allocation
      * comes through lisp_alloc() which makes this not a statistical
      * sample. Also the trapping ones don't trap for code.
-     * #+win32 doesn't seem to work, but neither does CPU profiling */
+     */
 #if !(defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64 \
-      || defined LISP_FEATURE_SPARC || defined LISP_FEATURE_WIN32)
+      || defined LISP_FEATURE_SPARC)
     extern void allocator_record_backtrace(void*, struct thread*);
     if (page_type != PAGE_TYPE_CODE && gencgc_alloc_profiler && thread->sprof_enable)
         allocator_record_backtrace(__builtin_frame_address(0), thread);

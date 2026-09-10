@@ -120,7 +120,6 @@ inappropriate set of sampled threads, or possibly a profiler bug.~:@>"))
 ;;; or SB-EXT:TIMER depending on whether thread support exists.
 (defglobal *timer* nil)
 
-#+unix
 (defun start-profiling (&key (max-samples *max-samples*)
                         (mode *sampling-mode*)
                         (sample-interval *sample-interval*)
@@ -160,115 +159,150 @@ The following keyword args are recognized:
   ;; Starting the clock with an interval of zero or negative is meaningless.
   ;; If, by 0, you mean STOP-PROFILING then you should use STOP-PROFILING.
   (declare (type (real (0)) sample-interval))
-  (when alloc-interval (warn "ALLOC-INTERVAL is ignored"))
-  (when max-depth (warn "MAX-DEPTH is ignored"))
-  #-generational
-  (when (eq mode :alloc)
-    (error "Allocation profiling is only supported for builds using the generational garbage collector."))
-  #-sb-thread (unless (eq threads :all) (warn ":THREADS is ignored"))
-  (when *profiling*
-    (warn "START-PROFILING will STOP-PROFILING first before applying new parameters")
-    (stop-profiling))
-  ;; I'm 99% sure that unconditionally assigning *SAMPLES* is a bug,
-  ;; because doing it makes the RESET function (and the :RESET keyword
-  ;; to WITH-PROFILING) meaningless - what's the difference between
-  ;; resetting and not resetting if either way causes all previously
-  ;; acquired traces to disappear? My intuition would have been that
-  ;; start/stop/start/stop should leave *SAMPLES* holding a union of all
-  ;; traces captured by both "on" periods, whereas with a RESET in between
-  ;; it would not. But they behave identically, because this is a reset.
-  (setf *samples* (make-samples mode sample-interval))
-  (setf trace-limit max-samples trace-count 0)
-  (enable-call-counting)
-  #+sb-thread (setf sb-thread::*profiled-threads* threads)
-  ;; Each existing threads' sprof-enable slot needs to reflect the desired set.
-  (sb-thread::avltree-filter
-   (lambda (node &aux (thread (sb-thread::avlnode-data node)))
-     (if (or (eq threads :all) (memq thread threads))
-         (start-sampling thread)
-         (stop-sampling thread)))
-   sb-thread::*all-threads*)
-  ;; The signal handler is entirely in C now. install_handler() uses the argument
-  ;; as a boolean flag. -1 means "install", 0 means "uninstall" which we don't do.
-  ;; Statistical allocation profiling is not signal-based- instead, whenever a C call
-  ;; occurs to handle thread-local allocation region overflow, a trace is recorded.
-  (unless (eq mode :alloc)
-    (with-alien ((%sigaction (function void int signed) :extern "install_handler"))
-      (alien-funcall %sigaction sb-unix:sigprof -1)))
-  ;; Keep all code live no matter if apparently unreferenced
-  (setf (extern-alien "sb_sprof_enabled" int) 1)
-  (ecase mode
-    (:alloc
-     (setq enable-alloc-profiler 1))
-    (:cpu
-     (multiple-value-bind (secs usecs)
-         (multiple-value-bind (secs rest) (truncate sample-interval)
-           (values secs (truncate (* rest 1000000))))
-       (unix-setitimer :profile secs usecs secs usecs)))
-    (:time
-     #+sb-thread
-     (flet ((map-threads (function &aux (threads sb-thread::*profiled-threads*))
-              (if (listp threads)
-                  (mapc function threads)
-                  (named-let visit ((node sb-thread::*all-threads*))
-                    (awhen (sb-thread::avlnode-left node) (visit it))
-                    (awhen (sb-thread::avlnode-right node) (visit it))
-                    (let ((thread (sb-thread::avlnode-data node)))
-                      (when (and (= (sb-thread::thread-%visible thread) 1)
-                                 (neq thread *timer*))
-                        (funcall function thread)))))))
-       (sb-thread::start-thread
-          (setf *timer* (sb-thread::%make-thread "SPROF timer" nil (sb-thread:make-semaphore)))
-          (lambda ()
-            (loop (unless *timer* (return))
-                  (sleep sample-interval)
-                  (map-threads
-                   (lambda (thread)
-                     (sb-thread:with-tls-lock (thread c-thread)
-                       (unless (= c-thread 0)
-                         (sb-unix:pthread-kill (sb-thread::thread-os-thread thread)
-                                               sb-unix:sigprof)))))))
-          nil))
-     #-sb-thread
-     (schedule-timer (setf *timer* (make-timer (lambda () (unix-kill 0 sb-unix:sigprof))
-                                               :name "SPROF timer"))
-                     sample-interval :repeat-interval sample-interval)))
-  (setq *profiling* mode))
+  (with-profiler-lock
+    (check-type mode sampling-mode)
+    (check-type max-samples (integer 0 #x7fffffff))
+    #+sb-thread
+    (unless (or (eq threads :all)
+                (and (listp threads) (every #'sb-thread::thread-p threads)))
+      (error "Invalid profiler thread selection: ~S" threads))
+    (when alloc-interval (warn "ALLOC-INTERVAL is ignored"))
+    (when max-depth (warn "MAX-DEPTH is ignored"))
+    #-generational
+    (when (eq mode :alloc)
+      (error "Allocation profiling is only supported for builds using the generational garbage collector."))
+    #-sb-thread (unless (eq threads :all) (warn ":THREADS is ignored"))
+    (when *profiling*
+      (warn "START-PROFILING will STOP-PROFILING first before applying new parameters")
+      (stop-profiling))
+    ;; I'm 99% sure that unconditionally assigning *SAMPLES* is a bug,
+    ;; because doing it makes the RESET function (and the :RESET keyword
+    ;; to WITH-PROFILING) meaningless - what's the difference between
+    ;; resetting and not resetting if either way causes all previously
+    ;; acquired traces to disappear? My intuition would have been that
+    ;; start/stop/start/stop should leave *SAMPLES* holding a union of all
+    ;; traces captured by both "on" periods, whereas with a RESET in between
+    ;; it would not. But they behave identically, because this is a reset.
+    #+win32
+    (call-with-each-profile-buffer (lambda (sap thread usage)
+                                     (declare (ignore sap thread usage))))
+    #+win32
+    (setf sample-interval (win32-sprof-interval (coerce sample-interval 'double-float)
+                                               (if (eq mode :cpu) 1 0)))
+    (setf *samples* (make-samples mode sample-interval))
+    (setf trace-limit max-samples trace-count 0)
+    (setf *profiling* mode)
+    (let ((started nil))
+      (unwind-protect
+           (progn
+             (enable-call-counting)
+             #+sb-thread (setf sb-thread::*profiled-threads* threads)
+             ;; Each existing threads' sprof-enable slot needs to reflect the desired set.
+             (sb-thread::avltree-filter
+              (lambda (node &aux (thread (sb-thread::avlnode-data node)))
+                (if (or (eq threads :all) (memq thread threads))
+                    (start-sampling thread)
+                    (stop-sampling thread)))
+              sb-thread::*all-threads*)
+             ;; The signal handler is entirely in C now. install_handler() uses the argument
+             ;; as a boolean flag. -1 means "install", 0 means "uninstall" which we don't do.
+             ;; Statistical allocation profiling is not signal-based- instead, whenever a C call
+             ;; occurs to handle thread-local allocation region overflow, a trace is recorded.
+             #+unix
+             (unless (eq mode :alloc)
+               (with-alien ((%sigaction (function void int signed) :extern "install_handler"))
+                 (alien-funcall %sigaction sb-unix:sigprof -1)))
+             ;; Keep all code live no matter if apparently unreferenced
+             (setf (extern-alien "sb_sprof_enabled" int) 1)
+             #+win32 (setf windows-recording 1)
+             (ecase mode
+               (:alloc
+                (setq enable-alloc-profiler 1))
+               (:cpu
+                #+win32 (windows-start-profiler mode sample-interval threads)
+                #-win32
+                (multiple-value-bind (secs usecs)
+                    (multiple-value-bind (secs rest) (truncate sample-interval)
+                      (values secs (truncate (* rest 1000000))))
+                  (unix-setitimer :profile secs usecs secs usecs)))
+               (:time
+                #+win32 (windows-start-profiler mode sample-interval threads)
+                #-win32
+                (progn
+                  #+sb-thread
+                  (flet ((map-threads (function &aux (threads sb-thread::*profiled-threads*))
+                           (if (listp threads)
+                               (mapc function threads)
+                               (named-let visit ((node sb-thread::*all-threads*))
+                                 (awhen (sb-thread::avlnode-left node) (visit it))
+                                 (awhen (sb-thread::avlnode-right node) (visit it))
+                                 (let ((thread (sb-thread::avlnode-data node)))
+                                   (when (and (= (sb-thread::thread-%visible thread) 1)
+                                              (neq thread *timer*))
+                                     (funcall function thread)))))))
+                    (sb-thread::start-thread
+                       (setf *timer* (sb-thread::%make-thread "SPROF timer" nil (sb-thread:make-semaphore)))
+                       (lambda ()
+                         (loop (unless *timer* (return))
+                               (sleep sample-interval)
+                               (map-threads
+                                (lambda (thread)
+                                  (sb-thread:with-tls-lock (thread c-thread)
+                                    (unless (= c-thread 0)
+                                      (sb-unix:pthread-kill (sb-thread::thread-os-thread thread)
+                                                            sb-unix:sigprof)))))))
+                       nil))
+                  #-sb-thread
+                  (schedule-timer (setf *timer* (make-timer (lambda () (unix-kill 0 sb-unix:sigprof))
+                                                            :name "SPROF timer"))
+                                  sample-interval :repeat-interval sample-interval))))
+             (setf started t)
+             mode)
+        (unless started (reset))))))
 
-;;; Though the profiler doesn't work for #+win32 this definition is kept here
-;;; because otherwise you also have to conditionalize out MAKE-CALL-GRAPH and RESET
-;;; and whatever calls those, and so on.
 (defun stop-profiling ()
   "Stop profiling if profiling."
-  (let ((profiling *profiling*))
-    (when profiling
-      ;; Even with the timers shut down we cannot be sure that there is no
-      ;; undelivered sigprof.
-      (ecase profiling
-        (:alloc
-         (setq enable-alloc-profiler 0))
-        (:cpu
-         #+unix (unix-setitimer :profile 0 0 0 0))
-        (:time
-         (let ((timer *timer*))
-           ;; after this assignment, the timer thread will raise the
-           ;; profiling signal at most once more, and then stop.
-           (setf *timer* nil)
-           #-sb-thread (unschedule-timer timer)
-           #+sb-thread (sb-thread:join-thread timer))))
-     (disable-call-counting)
-     ;; New threads should not mask SIGPROF by default
-     #+sb-thread (setf sb-thread::*profiled-threads* :all)
-     (let ((samples *samples*))
-       (aver samples)
-       (setf (samples-trace-count samples) trace-count))
-     (setf *profiling* nil)))
-  (values))
+  (with-profiler-lock
+    (let ((profiling *profiling*))
+      (when profiling
+        ;; Even with the timers shut down we cannot be sure that there is no
+        ;; undelivered sigprof.
+        (ecase profiling
+          (:alloc
+           (setq enable-alloc-profiler 0))
+          (:cpu
+           #+win32 (windows-stop-profiler)
+           #+unix (unix-setitimer :profile 0 0 0 0))
+          (:time
+           #+win32 (windows-stop-profiler)
+           #-win32
+           (let ((timer *timer*))
+             ;; after this assignment, the timer thread will raise the
+             ;; profiling signal at most once more, and then stop.
+             (setf *timer* nil)
+             #-sb-thread (unschedule-timer timer)
+             #+sb-thread (when timer (sb-thread:join-thread timer)))))
+        #+win32 (windows-drain-profiler)
+        (disable-call-counting)
+        ;; New threads should not mask SIGPROF by default
+        #+sb-thread (setf sb-thread::*profiled-threads* :all)
+        (let ((samples *samples*))
+          (aver samples)
+          (setf (samples-trace-count samples) trace-count))
+        (setf *profiling* nil)))
+    (values)))
 
 (defun reset ()
   "Reset the profiler."
-  (stop-profiling)
-  (setq *samples* nil)
-  (setf trace-count 0)
-  (call-with-each-profile-buffer (lambda (x y z) (declare (ignore x y z))))
-  (values))
+  (with-profiler-lock
+    (stop-profiling)
+    (setq *samples* nil)
+    (setf trace-count 0)
+    (call-with-each-profile-buffer (lambda (x y z) (declare (ignore x y z))))
+    (setf (extern-alien "sb_sprof_enabled" int) 0)
+    (values)))
+
+#+win32
+(progn
+  (pushnew 'reset sb-ext:*save-hooks*)
+  (pushnew 'stop-profiling sb-ext:*exit-hooks*))

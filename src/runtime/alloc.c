@@ -721,7 +721,7 @@ alloc_thread_struct(void* spaces) {
     extra_data->gc_inhibited = 0;
 #endif
 
-#if defined LISP_FEATURE_UNIX && defined LISP_FEATURE_SB_THREAD
+#ifdef LISP_FEATURE_SB_THREAD
     os_sem_init(&extra_data->sprof_sem, 0);
 #endif
     th->sprof_data = 0;

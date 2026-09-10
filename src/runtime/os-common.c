@@ -35,6 +35,9 @@
 #if defined LISP_FEATURE_UNIX && defined LISP_FEATURE_SOFT_CARD_MARKS
 #include "gc.h" // for find_page_index
 #endif
+#if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_SB_THREAD
+#include <winternl.h>
+#endif
 
 /*
  * historically, this used sysconf to select the runtime page size
@@ -139,7 +142,34 @@ os_set_errno(int new_errno)
     errno = new_errno;
 }
 
-#if defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_UNIX && !defined USE_DARWIN_GCD_SEMAPHORES && !defined CANNOT_USE_POSIX_SEM_T
+#if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_SB_THREAD
+void
+os_sem_init(os_sem_t *sem, unsigned int value)
+{
+    *sem = CreateSemaphore(NULL, value, 0x7fffffff, NULL);
+    if (!*sem) lose("CreateSemaphore: %lu", GetLastError());
+}
+
+void
+os_sem_wait(os_sem_t *sem)
+{
+    if (WaitForSingleObject(*sem, INFINITE) != WAIT_OBJECT_0)
+        lose("WaitForSingleObject(semaphore): %lu", GetLastError());
+}
+
+void
+os_sem_post(os_sem_t *sem)
+{
+    if (!ReleaseSemaphore(*sem, 1, NULL))
+        lose("ReleaseSemaphore: %lu", GetLastError());
+}
+
+void
+os_sem_destroy(os_sem_t *sem)
+{
+    if (!CloseHandle(*sem)) lose("CloseHandle(semaphore): %lu", GetLastError());
+}
+#elif defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_UNIX && !defined USE_DARWIN_GCD_SEMAPHORES && !defined CANNOT_USE_POSIX_SEM_T
 void
 os_sem_init(os_sem_t *sem, unsigned int value)
 {

@@ -17,6 +17,22 @@ useful than the deterministic profiler when profiling functions in the
 @code{common-lisp} package, SBCL internals, or code where the instrumenting
 overhead is excessive.
 
+Windows supports CPU, wallclock, and allocation sampling. CPU sampling uses
+per-thread user plus kernel time and samples runnable threads asynchronously.
+Intervals shorter than the Windows CPU accounting tick are rounded up
+(commonly to 15.625 milliseconds); the report shows the effective interval.
+Brief bursts can be missed or observed after a scheduling transition, so
+longer profiling runs give better results. Under heavy CPU contention, a
+larger interval reduces missed samples; consult the reported loss counters.
+Wallclock sampling also observes sleeping and blocked threads, and its total
+sampled time adds across threads.
+
+Windows reports capture failures, bounded stack snapshots, timer overruns,
+and missed CPU samples. Missed intervals do not produce duplicate samples.
+Foreign frames without usable unwind information can truncate a trace.
+Profiling is stopped and raw buffers are released before saving a core,
+and can be started again after the core is loaded.
+
 Additionally @code{sb-sprof} includes a limited deterministic profiler
 which can be used for reporting the amounts of calls to some functions
 during

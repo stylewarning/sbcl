@@ -5,6 +5,7 @@ changes in sbcl-2.6.8 relative to sbcl-2.6.7:
     more accurate result for CONCATENATED-STREAM, and NULL on TWO-WAY-STREAM
     and ECHO-STREAM.
   * platform support:
+    ** SB-SPROF supports CPU, wallclock, and allocation profiling on Windows.
     ** improvements to code generation for the ARM64 backend.
     ** improved support for AVX512 instruction encoding and decoding.  (thanks
        to Arthur Miller)

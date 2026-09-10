@@ -5,6 +5,7 @@
   :serial t
   :components ((:file "package")
                (:file "record")
+               (:file "win32" :if-feature :win32)
                (:file "call-counting")
                (:file "graph")
                (:file "report")

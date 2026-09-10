@@ -5,6 +5,12 @@
 
 (in-package #:sb-sprof)
 
+#+win32 (defvar *profiler-lock* (sb-thread:make-mutex :name "SPROF control"))
+(defmacro with-profiler-lock (&body body)
+  #+win32 `(sb-thread:with-recursive-lock (*profiler-lock*)
+             (sb-sys:without-interrupts ,@body))
+  #-win32 `(progn ,@body))
+
 (deftype sampling-mode ()
   '(member :cpu :alloc :time))
 
@@ -24,6 +30,7 @@
   (trace-count     0                    :type sb-int:index)
   (unique-trace-count nil)
   (sampled-threads nil                  :type list)
+  (diagnostics nil                     :type list)
   ;; Metadata
   (mode            nil                  :type sampling-mode              :read-only t)
   (sample-interval (sb-int:missing-arg) :type (real (0))                 :read-only t))
@@ -124,11 +131,30 @@ EXPERIMENTAL: Interface subject to change."
     (apply #'format t format-string args)
     (finish-output)))
 
+#-win32
 (define-alien-routine "sb_toggle_sigprof" int (context system-area-pointer) (state int))
+
+#+win32
+(progn
+  (defun sb-toggle-sigprof (context state)
+    (declare (ignore context state))
+    0)
+  (define-alien-routine "win32_sprof_set_sampling" void (thread unsigned) (enable int))
+  (defun start-sampling (&optional (thread sb-thread:*current-thread*))
+    "Enable statistical sampling in THREAD."
+    (sb-thread:with-tls-lock (thread c-thread)
+      (unless (zerop c-thread) (win32-sprof-set-sampling c-thread 1)))
+    nil)
+  (defun stop-sampling (&optional (thread sb-thread:*current-thread*))
+    "Disable statistical sampling in THREAD."
+    (sb-thread:with-tls-lock (thread c-thread)
+      (unless (zerop c-thread) (win32-sprof-set-sampling c-thread 0)))
+    nil))
 
 ;;; If a thread wants sampling but had previously blocked SIGPROF,
 ;;; it will have to unblock the signal. We can use %INTERRUPT-THREAD
 ;;; to tell it to do that.
+#-win32
 (macrolet ((enabled ()
              ;; %SYMBOL-VALUE-IN-THREAD can return NIL causing stop/stop to have no effect,
              ;; as seems perfectly reasonable for statistical sampling of a non-running thread.
@@ -338,7 +364,15 @@ EXPERIMENTAL: Interface subject to change."
                (when (and sap (/= (sap-int sap) 0))
                  (process sap thread))))
            nil)
-         all-threads)))))
+         all-threads)
+        ;; A thread can exit between the first scan and the live-thread scan.
+        ;; Windows publishes its buffer while holding THREAD-STORAGE-LOCK.
+        #+win32
+        (loop for data = (atomic-pop sb-thread::*sprof-data*)
+              while data
+              do (destructuring-bind (sap . thread) data
+                   (when (and sap (eq (cas (car data) sap nil) sap))
+                     (process sap thread))))))))
 
 (defun convert-raw-data ()
   (let ((ht (build-serialno-to-code-map))
