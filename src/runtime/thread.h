@@ -68,7 +68,7 @@ struct extra_thread_data
     int gc_inhibited;
 #endif
 
-#if defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_UNIX
+#ifdef LISP_FEATURE_SB_THREAD
     // According to https://github.com/adrienverge/openfortivpn/issues/105
     //   "using GCD semaphore in signal handlers is documented to be unsafe"
     // which seems almost impossible to believe, considering that sem_t is
@@ -79,6 +79,8 @@ struct extra_thread_data
 #endif
     int sprof_lock;
 #ifdef LISP_FEATURE_WIN32
+    uint64_t sprof_cpu_deadline;
+    uword_t sprof_epoch;
     // these are different from the masks that interrupt_data holds
     sigset_t pending_signal_set;
     sigset_t blocked_signal_set;

@@ -8,6 +8,7 @@
 #include "code.h"
 #include "gc.h"
 #include "lispregs.h"
+#include "sprof.h"
 #if !defined LISP_FEATURE_X86 && !defined LISP_FEATURE_X86_64
 #include "callframe.inc"
 #endif
@@ -41,10 +42,6 @@
  *    For each which is movable, express the PC as a code serial# and offset.
  */
 
-#define ELEMENT_SIZE               8
-
-#define TRACE_BUFFER_LEN         300
-#define MAX_RECORDED_TRACE_LEN    62
 #define N_BUCKETS 0x10000
 #define HASH_MASK (N_BUCKETS-1)
 #ifdef LISP_FEATURE_64_BIT
@@ -71,34 +68,6 @@ struct sprof_data {
     // elements are always 8 bytes regardless of machine word size.
     uint32_t free_pointer;
     uint32_t capacity;
-};
-
-// Number of elements that are not part of the locs[] array.
-// An 'element' is 8 bytes.
-#define TRACE_PREFIX_ELEMENTS 2
-struct trace {
-    uint32_t next; // next trace with identical hash
-    uint32_t multiplicity; // number of times hit
-#ifdef LISP_FEATURE_64_BIT
-#define trace_len(trace) ((int32_t)((trace)->header))
-    uword_t header; // upper 32 bits are hash val, lower 32 are length
-    // each entry has the most-significant-bit on if the value represents
-    // <code-serial#, pc-offset> in  the high and low 4 byte.
-    // If it's just an address, the uppermost bit is clear.
-    // As far as I know, no architecture will have code as such a large
-    // addresses as to make the representation ambiguous.
-    uword_t locs[TRACE_BUFFER_LEN];
-#else
-#define trace_len(trace) trace->len
-    sword_t len;
-    uword_t hash;
-    // One entry is 2 lispwords. If word1 is 0, then word0 is a PC.
-    // Otherwise word0 is the code serial# and word1 is the pc offset.
-    // This could probably be reduced to 6 bytes per element by using 3 bytes to store
-    // a serial# and 3 bytes to store the offset within code.
-    // But then there would be access alignment issues to worry about.
-    struct loc { uint32_t word0, word1; } locs[TRACE_BUFFER_LEN];
-#endif
 };
 
 static inline struct trace* sprof_data_trace(struct sprof_data* data, uint32_t index) {
@@ -248,6 +217,7 @@ static int NO_SANITIZE_MEMORY stabilize(struct trace* trace)
             } else {
                 // Can't have any unstable locations in the result
                 STORE_PC(*trace, i, (uword_t)-1);
+                changedp = 1;
             }
         }
     }
@@ -255,9 +225,55 @@ static int NO_SANITIZE_MEMORY stabilize(struct trace* trace)
 }
 
 static int NO_SANITIZE_MEMORY
-gather_trace_from_context(struct thread* thread, os_context_t* context,
-                          struct trace* trace, int limit)
+read_frame(struct thread* thread, struct sprof_snapshot* snapshot,
+           uword_t address, uword_t* words)
 {
+    if ((address & (N_WORD_BYTES-1))
+        || address < (uword_t)thread->control_stack_start
+        || address > (uword_t)thread->control_stack_end - 2*N_WORD_BYTES)
+        return 0;
+    if (snapshot) {
+        if (address < snapshot->start || snapshot->size < 2*N_WORD_BYTES
+            || address - snapshot->start > snapshot->size - 2*N_WORD_BYTES)
+            return 0;
+        memcpy(words, snapshot->data + (address - snapshot->start), 2*N_WORD_BYTES);
+    } else {
+        memcpy(words, (void*)address, 2*N_WORD_BYTES);
+    }
+    return 1;
+}
+
+#if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_X86
+/* x86 allocation trampolines spill two or three registers BEFORE establishing
+ * EBP. Their return PC is above those spills, not at EBP+4. Recognize the
+ * epilogue at the return from C: MOV ESP,EBP; POP EBP; [MOV reg,EAX]; POPs; RET.
+ * This is the sequence emitted by src/assembly/x86/alloc.lisp. */
+static void x86_allocation_frame(struct thread* thread, struct sprof_snapshot* snapshot,
+                                 uword_t pc, uword_t fp, uword_t* words)
+{
+    if (!points_to_asm_code_p(pc)) return;
+    unsigned char* p = (void*)pc;
+    if (p[0] != 0x8b || p[1] != 0xe5 || p[2] != 0x5d) return;
+    p += 3;
+    if (p[0] == 0x8b && (p[1] & 0xc7) == 0xc0) p += 2;
+    int spills = 0;
+    while (spills < 3 && *p >= 0x58 && *p <= 0x5f) { ++spills; ++p; }
+    if ((spills == 2 || spills == 3) && *p == 0xc3) {
+        uword_t saved[2];
+        if (read_frame(thread, snapshot, fp + spills*N_WORD_BYTES, saved))
+            words[1] = saved[1];
+    }
+}
+#endif
+
+static int NO_SANITIZE_MEMORY
+gather_trace_from_context(struct thread* thread, os_context_t* context,
+                          struct trace* trace, int limit,
+                          struct sprof_snapshot* snapshot)
+{
+#if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_X86_64
+    return win32_sprof_unwind(thread, context, snapshot, trace->locs, limit, 0);
+#endif
     uword_t pc = os_context_pc(context);
     int len = 1;
 
@@ -270,8 +286,13 @@ gather_trace_from_context(struct thread* thread, os_context_t* context,
         // that understands foreign code compiled without frame pointers.
         // It's no different from what we have now though.
         for(;;) {
-            uword_t prev_fp = *fp;
-            uword_t prev_pc = fp[1];
+            uword_t words[2];
+            if (!read_frame(thread, snapshot, (uword_t)fp, words)) break;
+#if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_X86
+            x86_allocation_frame(thread, snapshot, pc, (uword_t)fp, words);
+#endif
+            uword_t prev_fp = words[0];
+            uword_t prev_pc = words[1];
 #ifdef LISP_FEATURE_64_BIT
             // If this can't possibly be a valid program counter,
             // change it to the "unknown" value.
@@ -283,6 +304,7 @@ gather_trace_from_context(struct thread* thread, os_context_t* context,
             if (prev_fp <= (uword_t)fp || prev_fp >= (uword_t)thread->control_stack_end
                 || in_stack_range(prev_pc, thread)) break;
             fp = (uword_t*)prev_fp;
+            pc = prev_pc;
         }
     }
 #else
@@ -298,6 +320,7 @@ gather_trace_from_context(struct thread* thread, os_context_t* context,
 #ifdef LISP_FEATURE_ARM64
 
         lispobj lr;
+        uword_t frame_words[2];
         unsigned inst = ((unsigned *) pc)[0];
 
         /* The first frame needs to be found */
@@ -320,9 +343,9 @@ gather_trace_from_context(struct thread* thread, os_context_t* context,
 
             /* Unless an asm routine is called within the same frame. */
             if ((((unsigned *) pc)[-1] | 0x1F0000) == 0xAA1F03FA) { // MOV CFP, Rx
-                if (!in_stack_range((uword_t)frame, thread))
+                if (!read_frame(thread, snapshot, (uword_t)frame, frame_words))
                     return len;
-                frame = (void*)frame->old_cont;
+                frame = (void*)frame_words[0];
             }
         }
         else if (inst == 0xF900075E) {  // STR LR, [CFP, #8]
@@ -330,9 +353,9 @@ gather_trace_from_context(struct thread* thread, os_context_t* context,
             lr = (lispobj)*os_context_register_addr(context, reg_LR);
             STORE_PC(*trace, len, lr);
             if (++len == limit) return len;
-            if (!in_stack_range((uword_t)frame, thread))
+            if (!read_frame(thread, snapshot, (uword_t)frame, frame_words))
                 return len;
-            frame = (void*)frame->old_cont;
+            frame = (void*)frame_words[0];
         } else if ((inst >> 25) == 0x4A && // BL Lx
                    ((((unsigned *) pc)[-1] | 0x1F0000) == 0xAA1F03FA)) { // MOV CFP, Rx
             /* A local call */
@@ -342,24 +365,25 @@ gather_trace_from_context(struct thread* thread, os_context_t* context,
             STORE_PC(*trace, 0, pc+offset);
             STORE_PC(*trace, len, pc+4);
             if (++len == limit) return len;
-            if (!in_stack_range((uword_t)frame, thread))
+            if (!read_frame(thread, snapshot, (uword_t)frame, frame_words))
                 return len;
-            frame = (void*)frame->old_cont;
+            frame = (void*)frame_words[0];
         }
         else {
             STORE_PC(*trace, 0, pc);
         }
 
         for (;;) {
-            if (!in_stack_range((uword_t)frame, thread))
+            if (!read_frame(thread, snapshot, (uword_t)frame, frame_words))
                 break;
-            lr = frame->saved_lra;
+            lr = frame_words[1];
 
             if (!component_ptr_from_pc((char*)lr))
                 break;
             STORE_PC(*trace, len, lr);
             if (++len == limit) break;
-            frame = (void*)frame->old_cont;
+            if (frame_words[0] >= (uword_t)frame) break;
+            frame = (void*)frame_words[0];
         }
 #else
         STORE_PC(*trace, 0, pc);
@@ -378,20 +402,23 @@ gather_trace_from_context(struct thread* thread, os_context_t* context,
          STORE_PC(*trace, 0, pc);
 
 #ifdef LISP_FEATURE_ARM64
-         if (foreign_function_call_active_p(thread)) {
-             struct call_frame* frame = (void*)access_control_frame_pointer(thread);
+         if (snapshot ? snapshot->foreignp : foreign_function_call_active_p(thread) != 0) {
+             struct call_frame* frame = (void*)(snapshot ? snapshot->frame_pointer
+                                                        : (uword_t)access_control_frame_pointer(thread));
              lispobj lr;
+             uword_t frame_words[2];
 
              for (;;) {
-                 if (!in_stack_range((uword_t)frame, thread))
+                 if (!read_frame(thread, snapshot, (uword_t)frame, frame_words))
                      break;
-                 lr = frame->saved_lra;
+                 lr = frame_words[1];
 
                  if (!component_ptr_from_pc((char*)lr))
                      break;
                  STORE_PC(*trace, len, lr);
                  if (++len == limit) break;
-                 frame = (void*)frame->old_cont;
+                 if (frame_words[0] >= (uword_t)frame) break;
+                 frame = (void*)frame_words[0];
              }
          }
 #endif
@@ -404,13 +431,27 @@ gather_trace_from_context(struct thread* thread, os_context_t* context,
 static int gather_trace_from_frame(struct thread* thread, uword_t* fp,
                                    struct trace* trace, int limit)
 {
+#if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_X86_64
+    CONTEXT registers;
+    RtlCaptureContext(&registers);
+    os_context_t context = { .win32_context = &registers };
+    return win32_sprof_unwind(thread, &context, NULL, trace->locs, limit, 1);
+#endif
     int len = 0;
 
 #if defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64
+#if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_X86
+    uword_t pc = 0;
+#endif
     if (fp >= thread->control_stack_start && fp < thread->control_stack_end) {
         for(;;) {
-            uword_t prev_fp = *fp;
-            uword_t prev_pc = fp[1];
+            uword_t words[2];
+            if (!read_frame(thread, NULL, (uword_t)fp, words)) break;
+#if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_X86
+            x86_allocation_frame(thread, NULL, pc, (uword_t)fp, words);
+#endif
+            uword_t prev_fp = words[0];
+            uword_t prev_pc = words[1];
 #ifdef LISP_FEATURE_64_BIT
             // If this can't possibly be a valid program counter,
             // change it to the "unknown" value.
@@ -422,7 +463,19 @@ static int gather_trace_from_frame(struct thread* thread, uword_t* fp,
             if (prev_fp <= (uword_t)fp || prev_fp >= (uword_t)thread->control_stack_end
                 || in_stack_range(prev_pc, thread)) break;
             fp = (uword_t*)prev_fp;
+#if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_X86
+            pc = prev_pc;
+#endif
         }
+    }
+#elif defined LISP_FEATURE_ARM64
+    /* The allocation trampolines publish the Lisp CFP before entering C. */
+    uword_t frame = (uword_t)access_control_frame_pointer(thread), words[2];
+    while (read_frame(thread, NULL, frame, words)) {
+        if (!component_ptr_from_pc((void*)words[1])) break;
+        STORE_PC(*trace, len, words[1]);
+        if (++len == limit || words[0] >= frame) break;
+        frame = words[0];
     }
 #else
     struct call_info info;
@@ -471,6 +524,7 @@ static struct sprof_data* enlarge_buffer(struct sprof_data* current,
                                          uint32_t new_capacity)
 {
     char * new_buffer = os_allocate(new_capacity * ELEMENT_SIZE);
+    if (!new_buffer) return 0;
     memcpy(new_buffer, current, current->free_pointer * ELEMENT_SIZE);
     os_deallocate((void*)current, current->capacity * ELEMENT_SIZE);
     current = (struct sprof_data*)new_buffer;
@@ -497,74 +551,119 @@ static struct sprof_data* enlarge_buffer(struct sprof_data* current,
 
 int sb_sprof_trace_ct;
 int sb_sprof_trace_ct_max;
+#ifdef LISP_FEATURE_WIN32
+/* Distinct from sb_sprof_enabled, which keeps code alive until conversion.
+ * STOP-PROFILING closes this gate and drains the per-thread writers. */
+int sb_sprof_recording;
+#endif
+
+static void finish_trace(struct trace* trace, int len)
+{
+    if (len > MAX_RECORDED_TRACE_LEN) {
+        int midpoint = MAX_RECORDED_TRACE_LEN/2;
+        int suffix = midpoint-1;
+        STORE_PC(*trace, midpoint, (uword_t)-1);
+        memmove(&trace->locs[midpoint+1], &trace->locs[len-suffix],
+                sizeof trace->locs[0] * suffix);
+        len = MAX_RECORDED_TRACE_LEN;
+    }
+    store_trace_header(trace, compute_hash(trace->locs, len), len);
+}
+
+/* Called with GC inhibited, after the target has resumed. */
+int sprof_prepare_trace(struct thread* th, os_context_t* context,
+                        struct sprof_snapshot* snapshot, struct trace* trace)
+{
+    int len = gather_trace_from_context(th, context, trace, TRACE_BUFFER_LEN, snapshot);
+    if (len < 1) return 0;
+    finish_trace(trace, len);
+    if (stabilize(trace))
+        store_trace_header(trace, compute_hash(trace->locs, trace_len(trace)), trace_len(trace));
+    return 1;
+}
 
 /* this could get false msan positives because Lisp don't mark stack words as clean
    so anything may appear as unwritten from C depending on whether any C code
    ever marked them. So it was basically down to luck whether this worked or not */
-static int NO_SANITIZE_MEMORY
-collect_backtrace(struct thread* th, int contextp, void* context_or_fp)
+int NO_SANITIZE_MEMORY
+sprof_store_trace(struct thread* th, struct trace* trace, int stable)
 {
-    int oldcount = __sync_fetch_and_add(&sb_sprof_trace_ct, 1);
-    if (oldcount >= sb_sprof_trace_ct_max) {
-        __sync_fetch_and_sub(&sb_sprof_trace_ct, 1);
-        return -1; // sample limit exceeded
-    }
-    struct trace trace;
-    int len;
-    if (contextp)
-        len = gather_trace_from_context(th, context_or_fp, &trace, TRACE_BUFFER_LEN);
-    else
-        len = gather_trace_from_frame(th, context_or_fp, &trace, TRACE_BUFFER_LEN);
-    if (len < 1) return len;
-    if (len > MAX_RECORDED_TRACE_LEN) {
-        // change excessively long trace to "hot_end ... elision_marker ... cold_end"
-        int midpoint = MAX_RECORDED_TRACE_LEN/2;
-        int suffix = midpoint-1;
-        STORE_PC(trace, midpoint, (uword_t)-1);
-        memmove(&trace.locs[midpoint+1], &trace.locs[len-suffix], N_WORD_BYTES*suffix);
-        len = MAX_RECORDED_TRACE_LEN;
-    }
+    int len = trace_len(trace);
     // Hash before trying to insert so that potentially the conversion of unstable
     // PCs to stable PCs can be skipped, if there is a hash match.
-    uword_t hash = compute_hash(trace.locs, len);
-    store_trace_header(&trace, hash, len);
+    uword_t hash = compute_hash(trace->locs, len);
+    store_trace_header(trace, hash, len);
 
     // Try to acquire the lock
-    if (__sync_val_compare_and_swap(&SPROF_LOCK(th), 0, LOCKED_BY_SELF)!=0)
+    if (__sync_val_compare_and_swap(&SPROF_LOCK(th), 0, LOCKED_BY_SELF)!=0) {
         return -2; // already locked
+    }
 
+    int result = 0, reserved = 0;
+#ifdef LISP_FEATURE_WIN32
+    if (!__sync_val_compare_and_swap(&sb_sprof_recording, 0, 0)) goto done;
+#endif
+    for (;;) {
+        int count = __sync_val_compare_and_swap(&sb_sprof_trace_ct, 0, 0);
+        if (count >= sb_sprof_trace_ct_max) { result = -1; goto done; }
+        if (__sync_val_compare_and_swap(&sb_sprof_trace_ct, count, count+1) == count) break;
+    }
+    reserved = 1;
     struct sprof_data* data = (void*)th->sprof_data;
     if (!data) data = initialize_sprof_data(th);
+    if (!data) goto done;
     uint32_t* pcount;
-    if ((pcount = hash_get(data, &trace, hash)) == NULL) {
-        if (stabilize(&trace)) { // changed ?
-            hash = compute_hash(trace.locs, len); // revise the hash
-            store_trace_header(&trace, hash, len);
-            pcount = hash_get(data, &trace, hash);
+    if ((pcount = hash_get(data, trace, hash)) == NULL) {
+        if (!stable && stabilize(trace)) { // changed ?
+            hash = compute_hash(trace->locs, len); // revise the hash
+            store_trace_header(trace, hash, len);
+            pcount = hash_get(data, trace, hash);
         }
         if (!pcount) { // still not found, insert it
             uint32_t n_elements = TRACE_PREFIX_ELEMENTS + len;
             uint32_t capacity = data->capacity;
             if (data->free_pointer + n_elements > capacity) {
                 // If we're at maximum capacity, bail out
-                if (capacity == CAPACITY_MAX) return 0;
+                if (capacity == CAPACITY_MAX) {
+                    th->sprof_enable = 0;
+                    goto done;
+                }
                 // Before enlarging the buffer, check whether anyone is trying
                 // to read it; if so, just bail out.
                 // This is not to avoid a race - that's taken care of by the
                 // cmpxchg - but it's preferable to drop the current sample
                 // versus make a bunch more system call while there is a waiter.
-                if (SPROF_LOCK(th) & LOCKED_BY_OTHER) return 0;
+                if (SPROF_LOCK(th) & LOCKED_BY_OTHER) goto done;
                 data = enlarge_buffer(data, 2*capacity);
+                if (!data) goto done;
                 th->sprof_data = (lispobj)data;
             }
-            pcount = hash_insert(data, &trace, hash);
+            pcount = hash_insert(data, trace, hash);
         }
     }
     ++*pcount;
-    return 1;
+    result = 1;
+done:
+    if (reserved && result != 1) __sync_fetch_and_sub(&sb_sprof_trace_ct, 1);
+    RELEASE_LOCK(th);
+    return result;
+}
+
+static int NO_SANITIZE_MEMORY
+collect_backtrace(struct thread* th, int contextp, void* context_or_fp)
+{
+    if (sb_sprof_trace_ct >= sb_sprof_trace_ct_max) return -1;
+    struct trace trace;
+    int len = contextp
+        ? gather_trace_from_context(th, context_or_fp, &trace, TRACE_BUFFER_LEN, NULL)
+        : gather_trace_from_frame(th, context_or_fp, &trace, TRACE_BUFFER_LEN);
+    if (len < 1) return 0;
+    finish_trace(&trace, len);
+    return sprof_store_trace(th, &trace, 0);
 }
 
 static void diagnose_failure(struct thread* thread) {
+#ifndef LISP_FEATURE_WIN32
     // MAX-SAMPLES bounds the memory growth within a constant factor for one thread,
     // but if multithreaded, each thread could allocate a buffer and grow it an
     // arbitrary number of times. The automatic disable tries to avoid an explosion
@@ -576,21 +675,20 @@ static void diagnose_failure(struct thread* thread) {
 #ifdef LISP_FEATURE_SB_THREAD
         char msg[100];
         int msglen = sprintf(msg,
-                             "WARNING: pthread %p disabled sprof sampler to limit memory use\n",
-                             (void*)pthread_self());
+                             "WARNING: thread %p disabled sprof sampler to limit memory use\n",
+                             (void*)thread->os_thread);
         ignore_value(write(2, msg, msglen));
 #endif
     }
+#else
+    /* On Windows the buffer can be detached as soon as the writer releases
+     * its lock. Do not inspect it here; the writer disables a full buffer. */
+    (void)thread;
+#endif
 }
 
 void record_backtrace_from_context(void *context, struct thread* thread) {
     int success = collect_backtrace(thread, 1, context) == 1;
-    // Release the lock. This synchronizes with acquire_sprof_data()
-    // which atomically adds LOCKED_BY_OTHER to the lock field.
-    // If that happens first, then the cmpxchg will fail, and we'll do
-    // a sem_post here. If this happens first, then the thread wishing to
-    // acquire the data will see that 'old' is 0, and it will be happy.
-    RELEASE_LOCK(thread);
     if (!success) diagnose_failure(thread);
 }
 
@@ -606,6 +704,7 @@ void record_backtrace_from_context(void *context, struct thread* thread) {
  * component_ptr_from_pc() in the signal handler.
  * The easy out is just to drop the sample; so that's what we do, and versus
  * blocking/unblocking SIGPROF in collect_garbage(), it avoids 2 system calls. */
+#ifndef LISP_FEATURE_WIN32
 void sigprof_handler(int sig, __attribute__((unused)) siginfo_t* info,
                      void *context)
 {
@@ -624,19 +723,19 @@ void sigprof_handler(int sig, __attribute__((unused)) siginfo_t* info,
     }
     errno = _saved_errno;
 }
+#endif
 
 #if !(defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64 || defined LISP_FEATURE_SPARC)
 void allocator_record_backtrace(void* frame_ptr, struct thread* thread)
 {
     int success = collect_backtrace(thread, 0, frame_ptr) == 1;
-    RELEASE_LOCK(thread);
     if (!success) diagnose_failure(thread);
 }
 #endif
 
 /// Ensuring mutual exclusivity with the SIGPROF handler,
 /// return the profiling data for 'thread', or 0 if none.
-uword_t acquire_sprof_data(struct thread* thread)
+static void acquire_sprof_lock(struct thread* thread)
 {
     int old = __sync_fetch_and_or(&SPROF_LOCK(thread), LOCKED_BY_OTHER);
 #ifdef LISP_FEATURE_SB_THREAD
@@ -652,6 +751,19 @@ uword_t acquire_sprof_data(struct thread* thread)
 #else
     gc_assert(old == 0);
 #endif
+}
+
+#ifdef LISP_FEATURE_WIN32
+void sprof_synchronize(struct thread* thread)
+{
+    acquire_sprof_lock(thread);
+    __sync_fetch_and_and(&SPROF_LOCK(thread), 0);
+}
+#endif
+
+uword_t acquire_sprof_data(struct thread* thread)
+{
+    acquire_sprof_lock(thread);
     // sync cas prevents reading before setting the lock
     uword_t retval = __sync_val_compare_and_swap(&thread->sprof_data, 0, 0);
     // if data were allocated, then set the field to 0

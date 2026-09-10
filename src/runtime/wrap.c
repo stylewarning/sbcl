@@ -544,7 +544,7 @@ void sb_nanosleep_float(float seconds) {
 #endif
 
 /* 64-bit timeval */
-#if !defined(LISP_FEATURE_64_BIT) || defined (LISP_FEATURE_NETBSD)
+#if defined LISP_FEATURE_UNIX && (!defined(LISP_FEATURE_64_BIT) || defined(LISP_FEATURE_NETBSD))
 /* These thin wrappers are needed due to "linker rewriting"
  * acording to git revision 9304704f68 */
 int sb_getrusage(int who, struct rusage *rusage)

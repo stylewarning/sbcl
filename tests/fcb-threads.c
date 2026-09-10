@@ -96,7 +96,7 @@ int call_thing_from_threads(void* ptr, int n_threads, int n_calls)
         threads[i].arg.index = i + 1;
         threads[i].arg.n_calls = n_calls;
 #ifdef _WIN32
-        threads[i].handle = (HANDLE)_beginthreadex(NULL, 0, (unsigned int (*)(void *))doThatThing, &threads[i].arg, 0, NULL);
+        threads[i].handle = (HANDLE)_beginthreadex(NULL, 0, (unsigned int (__stdcall *)(void *))doThatThing, &threads[i].arg, 0, NULL);
 #else
         pthread_create(&threads[i].pthread_id, 0, doThatThing, &threads[i].arg);
 #endif

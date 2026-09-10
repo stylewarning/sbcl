@@ -1975,11 +1975,19 @@ session."
                ;; This doesn't need to synchronize with the signal handler, which is
                ;; effectively disabled now, but does synchronize via THREAD-STORAGE-LOCK
                ;; with any other thread trying to read this thread's data.
-               (shiftf (sap-ref-word (descriptor-sap c-thread)
-                                     (ash sb-vm:thread-sprof-data-slot sb-vm:word-shift))
-                       0))))
+               (let ((data (shiftf (sap-ref-word (descriptor-sap c-thread)
+                                               (ash sb-vm:thread-sprof-data-slot sb-vm:word-shift))
+                                   0)))
+                 ;; A Windows profiler can sample this thread from another
+                 ;; thread. Publish the detached buffer before releasing the
+                 ;; lock, so observing a dead thread also observes its data.
+                 #+win32
+                 (unless (zerop data)
+                   (sb-ext:atomic-push (cons (int-sap data) thread) *sprof-data*))
+                 data))))
         ;; Atomically transfer sprof results to the global pool.
-        (when (/= sprof-data 0)
+        #+win32 (declare (ignore sprof-data))
+        #-win32 (when (/= sprof-data 0)
           (sb-ext:atomic-push (cons (int-sap sprof-data) thread) *sprof-data*)))
       ;; After making the thread dead, remove from session. If this were done first,
       ;; we'd just waste time moving the thread into SESSION-THREADS (if it wasn't there)

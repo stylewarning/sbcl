@@ -46,4 +46,36 @@ run_sbcl_with_core "$tmpcore" --noinform --no-userinit --no-sysinit --noprint <<
 EOF
 check_status_maybe_lose "SAVE-LISP-AND-DIE NOPURIFY" $? 0 "(unpurified core ran)"
 
+# Saving an active Windows profile must stop the sampler and discard native
+# state. The saved core must support starting a new profile in every mode.
+run_sbcl --eval '(progn #-win32 (sb-ext:exit :code 104))' --quit
+case $? in
+    0)
+        for mode in cpu time alloc; do
+            run_sbcl <<EOF
+  (require :sb-sprof)
+  (sb-sprof:start-profiling :mode :$mode :sample-interval .01)
+  (sleep .05)
+  (sb-ext:save-lisp-and-die "$tmpcore")
+EOF
+            check_status_maybe_lose "Saving an active $mode profile" $? 0 "(saved core)"
+            run_sbcl_with_core "$tmpcore" <<EOF
+  (assert (null sb-sprof::*profiling*))
+  (assert (null sb-sprof::*windows-profiler*))
+  (assert (null sb-sprof::*samples*))
+  (sb-sprof:start-profiling :mode :$mode :sample-interval .01)
+  (dotimes (i 10000) (make-array 100))
+  (sleep .05)
+  (sb-sprof:stop-profiling)
+  (sb-sprof:report :type nil)
+  (sb-sprof:reset)
+  (sb-ext:exit :code $EXIT_LISP_WIN)
+EOF
+            check_status_maybe_lose "Restarting an active $mode profile" $?
+        done
+        ;;
+    104) ;;
+    *) exit $EXIT_LOSE ;;
+esac
+
 exit $EXIT_TEST_WIN

@@ -53,6 +53,10 @@
                 nsamples
                 interval
                 (* nsamples interval)))
+    (when (call-graph-diagnostics call-graph)
+      (format t "~%Windows sampling diagnostics:")
+      (loop for (name value) on (call-graph-diagnostics call-graph) by #'cddr
+            do (format t "~%   ~(~A~): ~D" name value)))
     (format t "~%Graph cycles:        ~d~%~
                Sampled threads:~%" ncycles)
     (loop for (thread bytes-used bytes-reserved buckets-used)
@@ -269,15 +273,16 @@ resulting call-graph, or NIL if there are no samples (e.g. right after
 calling RESET.)
 
 Profiling is stopped before the call graph is generated."
-  (acond (*samples*
-          (let ((graph (or call-graph (make-call-graph it most-positive-fixnum))))
-           (ecase type
-             (:flat
-              (print-flat graph :stream stream :max max :min-percent min-percent))
-             (:graph
-              (print-graph graph :stream stream :max max :min-percent min-percent))
-             ((nil)))
-           graph))
-         (t
-          (format stream "~&; No samples to report.~%")
-          nil)))
+  (with-profiler-lock
+    (acond (*samples*
+            (let ((graph (or call-graph (make-call-graph it most-positive-fixnum))))
+              (ecase type
+                (:flat
+                 (print-flat graph :stream stream :max max :min-percent min-percent))
+                (:graph
+                 (print-graph graph :stream stream :max max :min-percent min-percent))
+                ((nil)))
+              graph))
+           (t
+            (format stream "~&; No samples to report.~%")
+            nil))))

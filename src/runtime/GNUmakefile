@@ -76,11 +76,14 @@ COMMON_SRC = alloc.c arena.c backtrace.c breakpoint.c coalesce.c	\
 	math.c monitor.c murmur_hash.c os-common.c parse.c              \
 	perfecthash.c print.c time.c                                    \
 	regnames.c runtime.c safepoint.c save.c                         \
-	sc-offset.c search.c stringspace.c thread.c stop-the-world.c    \
+	sc-offset.c search.c sprof.c stringspace.c thread.c stop-the-world.c \
 	validate.c var-io.c vars.c wrap.c
 
 ifndef LISP_FEATURE_WIN32
-COMMON_SRC += run-program.c sprof.c
+COMMON_SRC += run-program.c
+else
+COMMON_SRC += win32-sprof.c
+OS_LIBS += -ldbghelp
 endif
 
 C_SRC = $(COMMON_SRC) ${ARCH_SRC} ${OS_SRC} ${GC_SRC}
