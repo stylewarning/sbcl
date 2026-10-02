@@ -622,3 +622,22 @@
     (try `(vminmaxph ,ymm31 ,ymm16 ,ymm17 0))
     (try `(vaddps ,xmm31 ,xmm16 ,xmm17))
     (try `(vminmaxss ,xmm31 ,xmm16 ,xmm17 0))))
+
+#+x86-64
+(test-util:with-test (:name :scan-relative-operands-undecodable)
+  (let* ((bytes (make-array 16 :element-type '(unsigned-byte 8)
+                              :initial-element #x90))
+         (code (sb-kernel:fun-code-header #'identity))
+         (dstate (sb-disassem:make-dstate nil))
+         (segment (sb-disassem::%make-segment :sap-maker (lambda () (sb-sys:int-sap 0))))
+         (calls 0))
+    (flet ((scan ()
+             (sb-sys:with-pinned-objects (bytes)
+               (sb-x86-64-asm::scan-relative-operands
+                code (sb-sys:sap-int (sb-sys:vector-sap bytes)) 6 dstate segment
+                (lambda (&rest args) (declare (ignore args)) (incf calls))))))
+      (assert (zerop (scan)))
+      ;; An invalid EVEX prefix cannot establish instruction boundaries.
+      (replace bytes '(#x62 0 0 0 0 0))
+      (assert (plusp (scan)))
+      (assert (zerop calls)))))

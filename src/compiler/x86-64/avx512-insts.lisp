@@ -66,46 +66,6 @@
   (def vmovdqu32 #xf3 #x6f #x7f 0)
   (def vmovdqu64 #xf3 #x6f #x7f 1))
 
-(macrolet ((def (name prefix w)
-             `(define-instruction ,name (segment dst src &optional src2)
-                ,@(avx2-inst-printer-list 'ymm-ymm/mem-dir prefix #b0001000)
-                (:emitter
-                 (cond ((ea-p src)
-                        (if (zmm-register-p dst)
-                            (emit-avx512-inst segment src dst ,prefix #x10 :w ,w)
-                            (emit-avx2-inst segment src dst ,prefix #x10 :l 0 :w ,w)))
-
-                       ((and (ea-p dst) (zmm-register-p src))
-                        (emit-avx512-inst segment dst src ,prefix #x11 :w ,w))
-
-                       ((and (integerp src) src2 (register-p src2))
-                        (if (or (zmm-register-p dst) (zmm-register-p src2))
-                            (emit-avx512-inst segment src2 dst ,prefix #x10 :w ,w)
-                            (emit-avx2-inst segment src2 dst ,prefix #x10 :l 0 :w ,w)))
-
-                       ((and src2 (or (zmm-register-p dst)
-                                      (zmm-register-p src)
-                                      (zmm-register-p src2)))
-                        (emit-avx512-inst segment src2 dst ,prefix #x10 :vvvv src :w ,w))
-
-                       ((or (zmm-register-p dst)
-                            (zmm-register-p src))
-                        (emit-avx512-inst segment src dst ,prefix #x10 :vvvv dst :w ,w))
-
-                       ((and src src2 dst (xmm-register-p dst))
-                        (emit-avx2-inst segment src2 dst ,prefix #x10 :vvvv src :l 0 :w ,w))
-
-                       ((xmm-register-p dst)
-                        (if (register-p src)
-                            (emit-avx2-inst segment src dst ,prefix #x10 :vvvv dst :l 0 :w ,w)
-                            (emit-avx2-inst segment src dst ,prefix #x10 :l 0 :w ,w)))
-
-                       (t
-                        (aver (xmm-register-p src))
-                        (emit-avx2-inst segment dst src ,prefix #x11 :l 0 :w ,w)))))))
-  (def vmovsd #xf2 1)
-  (def vmovss #xf3 0))
-
 ;;; Ternary logic
 (macrolet ((def (name w)
              `(define-instruction ,name (segment dst src1 src2 imm)
@@ -252,7 +212,18 @@
                                    :remaining-bytes 1)
                  (emit-byte segment imm)))))
   (def vrndscaleps #x08 0)
-  (def vrndscalepd #x09 1)
+  (def vrndscalepd #x09 1))
+
+(macrolet ((def (name opcode w)
+             `(define-instruction ,name (segment dst src src2/imm &optional imm)
+                ,@(avx512-inst-printer-list 'ymm-ymm/mem-imm #x66 opcode
+                                            :opcode-prefix #x0f3a :w w)
+                (:emitter
+                 (unless imm (setf imm src2/imm src2/imm src))
+                 (emit-avx512-inst segment src2/imm dst #x66 ,opcode
+                                   :opcode-prefix #x0f3a :w ,w :ll 0 :vvvv src
+                                   :remaining-bytes 1)
+                 (emit-byte segment imm)))))
   (def vrndscaless #x0a 0)
   (def vrndscalesd #x0b 1))
 
@@ -677,17 +648,18 @@
                                 :more-fields '((/i 4))))
 
 ;;; Unsigned conversions (2-operand)
-(macrolet ((def (name prefix opcode w &optional (opcode-prefix #x0f))
+(macrolet ((def (name prefix opcode w &optional (opcode-prefix #x0f) narrow)
              `(define-instruction ,name (segment dst src)
                 ,@(avx512-inst-printer-list 'ymm-ymm/mem prefix opcode
                                             :opcode-prefix opcode-prefix :w w)
                 (:emitter
                  (emit-avx512-inst segment src dst ,prefix ,opcode
-                                   :opcode-prefix ,opcode-prefix :w ,w)))))
+                                   :opcode-prefix ,opcode-prefix :w ,w
+                                   :ll ,(and narrow :from-thing))))))
   (def vcvtps2udq  nil  #x79 0)
-  (def vcvtpd2udq  nil  #x79 1)
+  (def vcvtpd2udq  nil  #x79 1 #x0f t)
   (def vcvttps2udq nil  #x78 0)
-  (def vcvttpd2udq nil  #x78 1)
+  (def vcvttpd2udq nil  #x78 1 #x0f t)
   (def vcvtudq2ps  #xf2 #x7a 0)
   (def vcvtudq2pd  #xf3 #x7a 0))
 
@@ -997,13 +969,14 @@
                                 :opcode-prefix #x0f38 :w 1 :nds t))
 
 ;;; Convert packed integers to/from FP (DQ extensions)
-(macrolet ((def (name prefix opcode w &optional (opcode-prefix #x0f))
+(macrolet ((def (name prefix opcode w &optional (opcode-prefix #x0f) narrow)
              `(define-instruction ,name (segment dst src)
                 ,@(avx512-inst-printer-list 'ymm-ymm/mem prefix opcode
                                             :opcode-prefix opcode-prefix :w w)
                 (:emitter
                  (emit-avx512-inst segment src dst ,prefix ,opcode
-                                   :opcode-prefix ,opcode-prefix :w ,w)))))
+                                   :opcode-prefix ,opcode-prefix :w ,w
+                                   :ll ,(and narrow :from-thing))))))
   (def vcvtps2qq   #x66 #x7b 0)
   (def vcvtpd2qq   #x66 #x7b 1)
   (def vcvtps2uqq  #x66 #x79 0)
@@ -1012,9 +985,9 @@
   (def vcvttpd2qq  #x66 #x7a 1)
   (def vcvttps2uqq #x66 #x78 0)
   (def vcvttpd2uqq #x66 #x78 1)
-  (def vcvtqq2ps   nil  #x5b 1)
+  (def vcvtqq2ps   nil  #x5b 1 #x0f t)
   (def vcvtqq2pd   #xf3 #xe6 1)
-  (def vcvtuqq2ps  #xf2 #x7a 1)
+  (def vcvtuqq2ps  #xf2 #x7a 1 #x0f t)
   (def vcvtuqq2pd  #xf3 #x7a 1))
 
 ;;; Move mask (dword/qword to/from k)
@@ -1279,23 +1252,50 @@
 
 ;;;; ---- EVEX gather/scatter (ZMM width) ----
 
+(define-arg-type half-ymmreg
+  :prefilter #'prefilter-reg-r
+  :printer #'print-half-ymmreg)
+
+(macrolet ((def (name n printer)
+             `(define-arg-type ,name
+                :prefilter (lambda (dstate mod r/m)
+                             (decode-mod-r/m dstate mod r/m 'fpr :disp-n ,n :vsib t))
+                :printer #',printer)))
+  (def evex-vsib-dword 4 print-evex-vsib)
+  (def evex-vsib-qword 8 print-evex-vsib)
+  (def evex-half-vsib-qword 8 print-half-evex-vsib))
+
+(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
+  (defun avx512-vsib-printer-list (opcode w half-data scatter)
+    (avx512-inst-printer-list
+     'ymm-ymm/mem #x66 opcode :opcode-prefix #x0f38 :w w
+     :printer (if scatter
+                  '(:name :tab reg/mem " {" aaa "}, " reg)
+                  '(:name :tab reg " {" aaa "}, " reg/mem))
+     :more-fields `((reg/mem nil :type ',(cond ((zerop w) 'evex-vsib-dword)
+                                             ((evenp opcode) 'evex-half-vsib-qword)
+                                             (t 'evex-vsib-qword)))
+                    ,@(when half-data '((reg nil :type 'half-ymmreg)))))))
+
 ;;; EVEX gather: dst {k1}, vm (index in vector register, mask in k1-k7)
 ;;; Usage: (inst vpgatherqq-z dst (ea disp base zmm-index scale) mask)
 ;;;   where mask is 1-7 (must be k1-k7; k0 not allowed for gather/scatter)
 ;;;   The CPU reads 8 qwords from [base + zmm-index[i]*scale + disp] for
 ;;;   each lane i where k1 bit i is set; lane's mask bit is cleared on load.
-(macrolet ((def (name opcode w)
+(macrolet ((def (name opcode w &optional index-length)
              `(define-instruction ,name (segment dst vm mask)
+                ,@(avx512-vsib-printer-list opcode w index-length nil)
                 (:emitter
                  (aver (and (integerp mask) (<= 1 mask 7)))
                  (emit-avx512-inst segment vm dst #x66 ,opcode
                                    :opcode-prefix #x0f38
                                    :w ,w
+                                   :ll ,(and index-length '(avx-vector-length (ea-index vm)))
                                    :aaa mask
                                    :vm t)))))
   ;; Dword destinations (8 lanes, YMM dst; index is ZMM qword)
-  (def vpgatherqd-z #x91 1)
-  (def vgatherqps-z #x93 1)
+  (def vpgatherqd-z #x91 0 t)
+  (def vgatherqps-z #x93 0 t)
   ;; Qword destinations (8 lanes, ZMM dst; index is ZMM qword)
   (def vpgatherqq-z #x91 1)
   (def vgatherqpd-z #x93 1)
@@ -1307,17 +1307,19 @@
 
 ;;; EVEX scatter: vm {k1}, src (reverse direction)
 ;;; Usage: (inst vpscatterqq-z (ea disp base zmm-index scale) src mask)
-(macrolet ((def (name opcode w)
+(macrolet ((def (name opcode w &optional index-length)
              `(define-instruction ,name (segment vm src mask)
+                ,@(avx512-vsib-printer-list opcode w index-length t)
                 (:emitter
                  (aver (and (integerp mask) (<= 1 mask 7)))
                  (emit-avx512-inst segment vm src #x66 ,opcode
                                    :opcode-prefix #x0f38
                                    :w ,w
+                                   :ll ,(and index-length '(avx-vector-length (ea-index vm)))
                                    :aaa mask
                                    :vm t)))))
-  (def vpscatterqd-z #xa1 1)
-  (def vscatterqps-z #xa3 1)
+  (def vpscatterqd-z #xa1 0 t)
+  (def vscatterqps-z #xa3 0 t)
   (def vpscatterqq-z #xa1 1)
   (def vscatterqpd-z #xa3 1)
   (def vpscatterdd-z #xa0 0)

@@ -331,7 +331,7 @@
 ;;; MOD and R/M are the extracted bits from the instruction's ModRM byte.
 ;;; Depending on MOD and R/M, a SIB byte and/or displacement may be read.
 ;;; The REX.B and REX.X from dstate are appropriately consumed.
-(defun decode-mod-r/m (dstate mod r/m regclass &key (disp-n 1))
+(defun decode-mod-r/m (dstate mod r/m regclass &key (disp-n 1) vsib)
   (declare (type disassem-state dstate)
            (type (unsigned-byte 2) mod)
            (type (unsigned-byte 3) r/m))
@@ -373,7 +373,10 @@
                                   (extend +rex-b+ base-reg))
                                 (cond ((/= mod #b00) (displacement))
                                       ((= base-reg #b101) (read-signed-suffix 32 dstate)))
-                                (unless (= index-reg #b100) index-reg) ; index can't be RSP
+                                ;; VSIB has a vector index even when SIB.index=4.
+                                (if vsib
+                                    (+ index-reg (if (dstate-getprop dstate +evex-v-prime+) 16 0))
+                                    (unless (= index-reg #b100) index-reg))
                                 (ash 1 (ldb (byte 2 6) sib)))))
             ((/= mod #b00) (make-machine-ea full-reg (displacement)))
             ;; rex.b is not decoded in determining RIP-relative mode
@@ -782,6 +785,7 @@
 ;;; Disassemble memory of CODE from START-ADDRESS for LENGTH bytes
 ;;; calling FUNCTION on each instruction that has a PC-relative operand.
 ;;; If supplied, PREDICATE is used to filter out some function invocations.
+;;; Return the number of undecoded bytes; nonzero means the scan is unreliable.
 (defun scan-relative-operands
     (code start-address length dstate segment function
      &optional (predicate #'constantly-t))
@@ -798,7 +802,8 @@
          (address (get-lisp-obj-address code))
          (text-start (sap-int (code-instructions code)))
          (text-end (+ text-start (%code-text-size code)))
-         (sap (int-sap start-address)))
+         (sap (int-sap start-address))
+         (sb-disassem::*undecoded-bytes* 0))
     (setf (seg-virtual-location segment) start-address
           (seg-length segment) length
           (seg-sap-maker segment) (lambda () sap))
@@ -835,7 +840,8 @@
                           (aver (eql (logand (sap-ref-8 sap (1- (dstate-cur-offs dstate))) #xF0)
                                      #x40))) ; expect a REX prefix
                         (funcall function (+ (dstate-cur-offs dstate) 2) operand inst)))))))))
-     segment dstate nil)))
+     segment dstate nil)
+    sb-disassem::*undecoded-bytes*))
 
 ;;; A code signature (for purposes of the ICF pass) is a list of function
 ;;; signatures, each of which is cons of a vector of instruction bytes with some
